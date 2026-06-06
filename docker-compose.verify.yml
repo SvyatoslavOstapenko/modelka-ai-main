@@ -1,0 +1,64 @@
+# Верификация production-сборки локально
+# Использование:
+#   npm run verify:up     - сборка + запуск
+#   npm run verify:logs   - посмотреть логи
+#   npm run verify:down   - остановить
+#
+# После запуска приложение будет доступно на: http://localhost:3001
+
+services:
+  # Тестовая БД
+  db-verify:
+    image: postgres:17-alpine
+    container_name: verify_db
+    environment:
+      POSTGRES_USER: verify
+      POSTGRES_PASSWORD: verify123
+      POSTGRES_DB: verify_db
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -U verify -d verify_db" ]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - verify-net
+
+  # Production сборка приложения
+  app-verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: verify_app
+    environment:
+      # Подключение к тестовой БД
+      DATABASE_URL: postgresql://verify:verify123@db-verify:5432/verify_db
+      # Минимальные секреты для запуска
+      AUTH_SECRET: verify-secret-must-be-at-least-32-characters-long
+      AUTH_GOOGLE_ID: verify-google
+      AUTH_GOOGLE_SECRET: verify-google-secret
+      AUTH_YANDEX_ID: verify-yandex
+      AUTH_YANDEX_SECRET: verify-yandex-secret
+      FAL_KEY: verify-fal
+      FASHN_API_KEY: verify-fashn
+      AUTH_TRUST_HOST: "true"
+      NODE_ENV: production
+    ports:
+      - "3001:3000"
+    depends_on:
+      db-verify:
+        condition: service_healthy
+    networks:
+      - verify-net
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  verify-net:
+    driver: bridge

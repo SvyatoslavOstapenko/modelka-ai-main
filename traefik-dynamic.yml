@@ -1,0 +1,33 @@
+# Traefik Dynamic Configuration
+# Cloudflare Origin Certificate для modelka-ai.ru
+
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/origin.pem
+        keyFile: /etc/traefik/certs/origin.key
+
+http:
+  middlewares:
+    redirect-to-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+    buffering-uploads:
+      buffering:
+        maxRequestBodyBytes: 50000000
+        maxResponseBodyBytes: 50000000
+
+    retry-middleware:
+      retry:
+        attempts: 2
+        initialInterval: 100ms
+
+  serversTransports:
+    default:
+      forwardingTimeouts:
+        dialTimeout: "10s"
+        responseHeaderTimeout: "60s"
+        idleConnTimeout: "90s"

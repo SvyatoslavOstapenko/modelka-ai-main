@@ -1,0 +1,257 @@
+services:
+  # === TRAEFIK (Proxy & SSL) ===
+  traefik:
+    image: traefik:v3.6
+    container_name: traefik
+    command:
+      - "--log.level=WARN"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--ping=true"
+      - "--ping.entrypoint=web"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./certs:/etc/traefik/certs:ro"
+      - "./traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro"
+      - "/etc/localtime:/etc/localtime:ro"
+    networks:
+      proxy:
+        aliases:
+          - modelka-ai.ru
+    restart: unless-stopped
+    # РОТАЦИЯ ЛОГОВ (Защита диска)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "--quiet", "http://localhost:80/ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+  # === DATABASE ===
+  db:
+    image: postgres:17-alpine
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Оптимизация памяти Postgres для 6GB RAM
+    command: postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c maintenance_work_mem=256MB -c checkpoint_completion_target=0.9 -c wal_buffers=16MB -c default_statistics_target=100 -c random_page_cost=1.1 -c effective_io_concurrency=200 -c work_mem=8MB -c min_wal_size=1GB -c max_wal_size=4GB
+    volumes:
+      - ./pg-data:/var/lib/postgresql/data
+      - "/etc/localtime:/etc/localtime:ro"
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - internal
+    shm_size: 2g
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    labels:
+      - "autoheal=true"
+    deploy:
+      resources:
+        limits:
+          memory: 2.5G
+        reservations:
+          memory: 1G
+
+  # === BACKUP (PostgreSQL 17 -> Yandex S3) ===
+  backup:
+    build:
+      context: ./docker/backup
+      dockerfile: Dockerfile
+    container_name: db_backup
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # PostgreSQL подключение
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # Yandex Object Storage (S3-compatible)
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BACKUPS_BUCKET}
+      S3_REGION: ${S3_REGION}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_PREFIX: db-backups
+
+      # Мониторинг бэкапов (healthchecks.io)
+      HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}
+
+      # Часовой пояс
+      TZ: Europe/Moscow
+    networks:
+      - internal # Для доступа к PostgreSQL
+      - proxy # Для доступа к интернету (Yandex S3)
+    depends_on:
+      db:
+        condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # === APP ===
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: modelka_app
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - internal
+      - proxy
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - "/etc/localtime:/etc/localtime:ro"
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s # Увеличено для учета времени на миграции при старте
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    labels:
+      - "traefik.http.services.app.loadbalancer.serversTransport=default@file"
+      - "autoheal=true"
+      - "traefik.enable=true"
+      - "traefik.docker.network=modelka-ai_proxy"
+      - "traefik.http.services.app.loadbalancer.server.port=3000"
+      # Increase response timeout to prevent 504 errors
+      - "traefik.http.services.app.loadbalancer.responseforwarding.flushinterval=100ms"
+      - "traefik.http.services.app.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.app.rule=Host(`modelka-ai.ru`)"
+      - "traefik.http.routers.app.entrypoints=websecure"
+      - "traefik.http.routers.app.tls=true"
+      - "traefik.http.routers.app.service=app"
+      - "traefik.http.routers.app.middlewares=retry-middleware@file"
+      - "traefik.http.routers.app-http.rule=Host(`modelka-ai.ru`)"
+      - "traefik.http.routers.app-http.entrypoints=web"
+      - "traefik.http.routers.app-http.service=app"
+      - "traefik.http.routers.app-http.middlewares=redirect-to-https@file"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # === AUTOHEAL (Автоматический перезапуск неисправных контейнеров) ===
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 60
+      AUTOHEAL_START_PERIOD: 300
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "/etc/localtime:/etc/localtime:ro"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 32M
+
+  # === UPTIME KUMA (Мониторинг доступности сервисов) ===
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime_kuma
+    restart: unless-stopped
+    volumes:
+      - ./uptime-kuma-data:/app/data
+      - "/etc/localtime:/etc/localtime:ro"
+    networks:
+      - internal
+      - proxy
+    healthcheck:
+      test: [ "CMD", "node", "extra/healthcheck.js" ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.uptime-kuma.loadbalancer.server.port=3001"
+      - "traefik.http.routers.uptime-kuma.rule=Host(`status.modelka-ai.ru`)"
+      - "traefik.http.routers.uptime-kuma.entrypoints=websecure"
+      - "traefik.http.routers.uptime-kuma.tls=true"
+      - "traefik.http.routers.uptime-kuma.service=uptime-kuma"
+      - "traefik.http.routers.uptime-kuma-http.rule=Host(`status.modelka-ai.ru`)"
+      - "traefik.http.routers.uptime-kuma-http.entrypoints=web"
+      - "traefik.http.routers.uptime-kuma-http.service=uptime-kuma"
+      - "traefik.http.routers.uptime-kuma-http.middlewares=redirect-to-https@file"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+networks:
+  proxy:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "1450"
+  internal:
+    internal: true
+    driver_opts:
+      com.docker.network.driver.mtu: "1450"

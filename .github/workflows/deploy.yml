@@ -1,0 +1,90 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/modelka-ai
+            
+            # 1. Синхронизация кода (Source of Truth)
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # 2. Обновление секретов
+            echo "${{ secrets.PROD_ENV_FILE }}" > .env
+            
+            # 3. Предварительная чистка
+            docker system prune -f
+            
+            # 4. Сборка (Force Pull для обновления базовых образов)
+            docker compose -f docker-compose.prod.yml build --pull
+
+            # 5. Запуск базы данных для миграций
+            echo "🗄️  Starting database..."
+            docker compose -f docker-compose.prod.yml up -d db
+
+            # Ожидание готовности БД (до 30 секунд)
+            echo "⏳ Waiting for database to be ready..."
+            for i in {1..30}; do
+              if docker compose -f docker-compose.prod.yml exec -T db pg_isready -h 127.0.0.1 -U postgres > /dev/null 2>&1; then
+                echo "✅ Database is ready"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ Database failed to start within 30 seconds"
+                exit 1
+              fi
+              sleep 1
+            done
+
+            # 6. Перезапуск всех сервисов (Recreate containers)
+            # Миграции выполняются автоматически при старте контейнера app (см. Dockerfile CMD)
+            # --remove-orphans удалит контейнеры, которых нет в новом конфиге
+            echo "🔄 Restarting all services..."
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            # 7. Проверка здоровья приложения
+            echo "🏥 Checking application health..."
+            sleep 30  # Даем приложению время на миграции и старт
+
+            for i in {1..12}; do
+              HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://modelka-ai.ru/api/health || echo "000")
+
+              if [ "$HEALTH_STATUS" = "200" ]; then
+                # Дополнительная проверка JSON ответа
+                HEALTH_JSON=$(curl -s https://modelka-ai.ru/api/health)
+                if echo "$HEALTH_JSON" | grep -q '"status":"ok"'; then
+                  echo "✅ Application is healthy!"
+                  break
+                fi
+              fi
+
+              if [ $i -eq 12 ]; then
+                echo "❌ Health check failed after 60 seconds"
+                echo "Last HTTP status: $HEALTH_STATUS"
+                docker compose -f docker-compose.prod.yml logs app --tail 50
+                exit 1
+              fi
+
+              echo "⏳ Attempt $i/12: Health check returned $HEALTH_STATUS, retrying in 5s..."
+              sleep 5
+            done
+
+            # 8. Финальная чистка старых образов (экономия места)
+            docker image prune -f
+
+            echo "🎉 Deployment completed successfully!"

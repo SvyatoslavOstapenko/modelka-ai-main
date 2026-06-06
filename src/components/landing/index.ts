@@ -1,0 +1,10 @@
+export { BeforeAfterSlider } from './before-after-slider';
+export { HeroSection } from './hero-section';
+export { BentoGrid } from './bento-grid';
+export { HowItWorks } from './how-it-works';
+export { ExamplesGallery } from './examples-gallery';
+export { CaseStudies } from './case-studies';
+export { PricingTable } from './pricing-table';
+export { FAQSection } from './faq-section';
+export { LandingHeader } from './landing-header';
+export { LandingFooter } from './landing-footer';
